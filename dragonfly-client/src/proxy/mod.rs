@@ -16,11 +16,14 @@
 
 use crate::dynconfig::Dynconfig;
 use crate::grpc::REQUEST_TIMEOUT;
-use crate::resource::{piece::MIN_PIECE_LENGTH, task::Task};
+use crate::resource::{
+    piece::MIN_PIECE_LENGTH,
+    task::{Task, DEFAULT_STAT_SOURCE_TIMEOUT},
+};
 use bytes::Bytes;
 use dragonfly_api::common::v2::{Download, TaskType};
 use dragonfly_api::dfdaemon::v2::{
-    download_task_response, DownloadTaskRequest, DownloadTaskStartedResponse,
+    download_task_response, DownloadTaskRequest, DownloadTaskStartedResponse, StatLocalTaskResponse,
 };
 use dragonfly_api::errordetails::v2::Backend;
 use dragonfly_client_config::dfdaemon::{Config, Rule};
@@ -31,6 +34,7 @@ use dragonfly_client_metric::{
     collect_proxy_request_started_metrics, collect_proxy_request_via_dfdaemon_metrics,
 };
 use dragonfly_client_util::{
+    digest::is_manifest_digest_url,
     http::{hashmap_to_headermap, headermap_to_hashmap},
     shutdown,
     tls::{generate_self_signed_certs_by_ca_cert, generate_simple_self_signed_certs, NoVerifier},
@@ -486,6 +490,24 @@ pub async fn http_handler(
                 .await;
         }
 
+        if need_stat_without_source(&config, &request) {
+            info!(
+                "proxy HTTP request directly to remote server or stat without it: {:?}",
+                request
+            );
+
+            return proxy_via_stat_without_source(
+                config.clone(),
+                task,
+                rule,
+                request,
+                remote_ip,
+                http_client,
+                https_client,
+            )
+            .await;
+        }
+
         debug!(
             "proxy HTTP request bypassing dfdaemon for non-GET method: {:?}",
             request
@@ -770,6 +792,24 @@ pub async fn upgraded_handler(
                 .await;
         }
 
+        if need_stat_without_source(&config, &request) {
+            info!(
+                "proxy HTTPS request directly to remote server or stat without it: {:?}",
+                request,
+            );
+
+            return proxy_via_stat_without_source(
+                config.clone(),
+                task,
+                rule,
+                request,
+                remote_ip,
+                http_client,
+                https_client,
+            )
+            .await;
+        }
+
         debug!(
             "proxy HTTPS request bypassing dfdaemon for non-GET method: {:?}",
             request,
@@ -834,7 +874,7 @@ async fn proxy_via_dfdaemon(
 
     // Make the download task request.
     let download_task_request =
-        match make_download_task_request(config.clone(), rule, request, remote_ip) {
+        match make_download_task_request(config.clone(), rule, &request, remote_ip) {
             Ok(download_task_request) => download_task_request,
             Err(err) => {
                 error!("make download task request failed: {}", err);
@@ -1204,6 +1244,74 @@ async fn proxy_via_dfdaemon(
     }
 }
 
+/// Proxies the HEAD request of the manifest referenced by a digest directly to the
+/// remote server. If the remote server is unavailable, i.e. it does not respond in
+/// time, the request fails or it responds with a server error, responds with the
+/// metadata of the task from the local storage or the peers, so that the image can
+/// still be pulled by the digest from the peers.
+#[instrument(skip_all, fields(task_id))]
+async fn proxy_via_stat_without_source(
+    config: Arc<Config>,
+    task: Arc<Task>,
+    rule: &Rule,
+    request: Request<hyper::body::Incoming>,
+    remote_ip: std::net::IpAddr,
+    http_client: Client<HttpConnector, hyper::body::Incoming>,
+    https_client: Client<hyper_rustls::HttpsConnector<HttpConnector>, hyper::body::Incoming>,
+) -> ClientResult<Response> {
+    // Make the download of the manifest before the request is consumed, the task
+    // id is generated in the same way as the GET request of the manifest.
+    let download = make_download_task_request(config.clone(), rule, &request, remote_ip)
+        .and_then(|request| request.download.ok_or(ClientError::InvalidParameter));
+
+    let remote_response = async move {
+        if request.uri().scheme().cloned() == Some(http::uri::Scheme::HTTPS) {
+            proxy_via_https(request, https_client).await
+        } else {
+            proxy_via_http(request, http_client).await
+        }
+    };
+    tokio::pin!(remote_response);
+
+    // Wait for the remote server for a short time. The request is still in flight
+    // after the timeout, and is awaited if the metadata of the task is not found.
+    let result = tokio::select! {
+        result = &mut remote_response => Some(result),
+        _ = tokio::time::sleep(DEFAULT_STAT_SOURCE_TIMEOUT) => None,
+    };
+
+    let result = match result {
+        Some(Ok(response)) if !response.status().is_server_error() => return Ok(response),
+        result => result,
+    };
+
+    let response = async {
+        let download = download?;
+        let task_id = task::generate_task_id(&task, &download)?;
+        Span::current().record("task_id", task_id.as_str());
+
+        let task = task
+            .stat_without_source(task_id.as_str(), &download)
+            .await?;
+        make_stat_response(task_id.as_str(), config.host.ip.unwrap(), task)
+    }
+    .await;
+
+    match response {
+        Ok(response) => {
+            info!("remote server is unavailable, respond with the task metadata");
+            Ok(response)
+        }
+        Err(err) => {
+            warn!("stat task without source failed: {}", err);
+            match result {
+                Some(result) => result,
+                None => remote_response.await,
+            }
+        }
+    }
+}
+
 /// Proxies the HTTP request directly to the remote server.
 #[instrument(level = "debug", skip_all)]
 async fn proxy_via_http(
@@ -1314,7 +1422,7 @@ fn make_registry_mirror_request(
 fn make_download_task_request(
     config: Arc<Config>,
     rule: &Rule,
-    request: Request<hyper::body::Incoming>,
+    request: &Request<hyper::body::Incoming>,
     remote_ip: std::net::IpAddr,
 ) -> ClientResult<DownloadTaskRequest> {
     let header = request.headers();
@@ -1479,6 +1587,46 @@ fn make_response_headers(
     );
 
     Ok(headers)
+}
+
+/// Makes the response of the HEAD request by the metadata of the task.
+fn make_stat_response(
+    task_id: &str,
+    server_ip: std::net::IpAddr,
+    task: StatLocalTaskResponse,
+) -> ClientResult<Response> {
+    let content_length = task
+        .content_length
+        .ok_or(ClientError::InvalidContentLength)?;
+
+    let mut response = Response::new(empty());
+    *response.headers_mut() = make_response_headers(
+        task_id,
+        server_ip,
+        &DownloadTaskStartedResponse {
+            content_length,
+            response_header: task.response_header,
+            ..Default::default()
+        },
+    )?;
+
+    // The response header of the task may not carry the content length, which
+    // the client requires to resolve the manifest.
+    response
+        .headers_mut()
+        .insert(reqwest::header::CONTENT_LENGTH, content_length.into());
+
+    Ok(response)
+}
+
+/// Returns whether the request is answered by the metadata of the task when the
+/// remote server is unavailable. Only the HEAD request of the manifest referenced
+/// by a digest is, because the content of the digest never changes. The seed peer
+/// is excluded, because it is the one that downloads the task from the source.
+fn need_stat_without_source<B>(config: &Config, request: &Request<B>) -> bool {
+    !config.seed_peer.enable
+        && request.method() == Method::HEAD
+        && is_manifest_digest_url(&request.uri().to_string())
 }
 
 /// Returns whether the dfdaemon should be used to download the task.
@@ -1741,6 +1889,103 @@ mod tests {
             result,
             Err(ClientError::ExternalError(err)) if err.etype == ErrorType::ParseError
         ));
+    }
+
+    #[test]
+    fn make_stat_response_sets_the_content_length_of_the_task() {
+        let test_cases = vec![
+            HashMap::from([
+                (
+                    "content-type".to_string(),
+                    "application/vnd.oci.image.manifest.v1+json".to_string(),
+                ),
+                (
+                    "docker-content-digest".to_string(),
+                    "sha256:abc".to_string(),
+                ),
+            ]),
+            HashMap::from([
+                (
+                    "content-type".to_string(),
+                    "application/vnd.oci.image.manifest.v1+json".to_string(),
+                ),
+                (
+                    "docker-content-digest".to_string(),
+                    "sha256:abc".to_string(),
+                ),
+                ("content-length".to_string(), "1".to_string()),
+            ]),
+        ];
+
+        for response_header in test_cases {
+            let response = make_stat_response(
+                "task-id",
+                "127.0.0.1".parse().unwrap(),
+                StatLocalTaskResponse {
+                    content_length: Some(1000),
+                    response_header,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+            assert_eq!(response.status(), http::StatusCode::OK);
+            assert_eq!(
+                response
+                    .headers()
+                    .get_all(reqwest::header::CONTENT_LENGTH)
+                    .iter()
+                    .collect::<Vec<_>>(),
+                vec!["1000"]
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .unwrap(),
+                "application/vnd.oci.image.manifest.v1+json"
+            );
+            assert_eq!(
+                response.headers().get("docker-content-digest").unwrap(),
+                "sha256:abc"
+            );
+        }
+    }
+
+    #[test]
+    fn make_stat_response_requires_the_content_length() {
+        let result = make_stat_response(
+            "task-id",
+            "127.0.0.1".parse().unwrap(),
+            StatLocalTaskResponse::default(),
+        );
+        assert!(matches!(result, Err(ClientError::InvalidContentLength)));
+    }
+
+    #[test]
+    fn need_stat_without_source_requires_the_head_request_of_the_manifest_digest() {
+        let digest = "sha256:".to_string() + &"a".repeat(64);
+        let test_cases = vec![
+            (false, Method::HEAD, format!("manifests/{digest}"), true),
+            (true, Method::HEAD, format!("manifests/{digest}"), false),
+            (false, Method::GET, format!("manifests/{digest}"), false),
+            (false, Method::HEAD, "manifests/latest".to_string(), false),
+            (false, Method::HEAD, format!("blobs/{digest}"), false),
+        ];
+
+        for (is_seed_peer, method, path, expected) in test_cases {
+            let mut config = Config::default();
+            config.seed_peer.enable = is_seed_peer;
+            let request = Request::builder()
+                .method(method)
+                .uri(format!(
+                    "https://registry.example.com/v2/library/nginx/{path}"
+                ))
+                .body(())
+                .unwrap();
+
+            assert_eq!(need_stat_without_source(&config, &request), expected);
+        }
     }
 
     #[test]
